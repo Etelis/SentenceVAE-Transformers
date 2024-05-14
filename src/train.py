@@ -1,132 +1,146 @@
+import os
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from dataset import PTB
-from model import SentenceVAE
-from utils import save_model, plot_metrics
+from torch.utils.tensorboard import SummaryWriter
+from datetime import datetime
 from tqdm import tqdm
-import numpy as np
-import os
+from model import SentenceVAE
+from dataset import PTB
+from utils import kl_anneal_function, save_model_and_config
 
-def setup_datasets_and_loaders(args):
-    """Sets up the datasets and data loaders for training and validation.
+def prepare_datasets_and_loaders(args):
+    """
+    Prepare the datasets and dataloaders for training.
 
     Args:
-        args: Command line arguments including data directory, batch size, and max sequence length.
+        args (Namespace): Arguments containing configuration for the datasets and dataloaders.
 
     Returns:
-        Tuple containing dictionaries of datasets and dataloaders for 'train', 'valid', and optionally 'test'.
+        dict: Datasets for training.
+        dict: Dataloaders for training.
     """
-    datasets = {'train': PTB(args.data_dir, 'train', args.max_seq_length),
-                'valid': PTB(args.data_dir, 'valid', args.max_seq_length)}
+    datasets = {
+        'train': PTB(args.data_dir, 'train', args.max_seq_length)
+    }
     if args.test:
         datasets['test'] = PTB(args.data_dir, 'test', args.max_seq_length)
 
-    dataloaders = {x: DataLoader(datasets[x], batch_size=args.batch_size, shuffle=True if x == 'train' else False, num_workers=4, pin_memory=True) for x in datasets}
+    dataloaders = {
+        x: DataLoader(
+            datasets[x], 
+            batch_size=args.batch_size, 
+            shuffle=True, 
+            num_workers=4, 
+            pin_memory=True
+        ) 
+        for x in datasets
+    }
     return datasets, dataloaders
 
-def setup_model(args, datasets):
-    """Creates and initializes the SentenceVAE model.
+def initialize_model(args, datasets):
+    """
+    Initialize the SentenceVAE model with the appropriate configuration.
 
     Args:
-        args: Command line arguments with model configuration.
-        datasets: Datasets to extract tokenizer and special token details.
+        args (Namespace): Arguments containing model configuration.
+        datasets (dict): Datasets to extract tokenizer and special tokens information.
 
     Returns:
-        Initialized SentenceVAE model.
+        SentenceVAE: Initialized model.
     """
     special_tokens = {
-        'sos_token': datasets['train'].sos_token_id,
-        'eos_token': datasets['train'].eos_token_id,
-        'pad_token': datasets['train'].tokenizer.pad_token_id,
-        'unk_token': datasets['train'].tokenizer.unk_token_id
+        'bos_token_id': datasets['train'].tokenizer.bos_token_id,
+        'eos_token_id': datasets['train'].tokenizer.eos_token_id,
+        'pad_token_id': datasets['train'].tokenizer.pad_token_id,
+        'unk_token_id': datasets['train'].tokenizer.unk_token_id
     }
-    vocab_size = datasets['train'].tokenizer.vocab_size
-    model = SentenceVAE(
-        latent_dim=args.latent_dim, 
-        hidden_size=args.hidden_size, 
-        vocab_size=vocab_size, 
-        special_tokens=special_tokens, 
-        max_seq_length=args.max_seq_length, 
+    
+    return SentenceVAE(
+        latent_dim=args.latent_dim,
+        hidden_size=args.hidden_size,
+        vocab_size=len(datasets['train'].tokenizer),
+        special_tokens=special_tokens,
+        max_seq_length=args.max_seq_length,
+        word_dropout_rate=args.word_dropout_rate,
         gru_layers=args.gru_layers
     )
-    return model
 
-def setup_loss_function(datasets):
-    """Configures the loss function for training the SentenceVAE model.
+def configure_loss_function(datasets):
+    """
+    Configure the loss function for training.
 
     Args:
-        datasets: Datasets to get tokenizer configurations for ignoring padding in loss calculations.
+        datasets (dict): Datasets to extract the tokenizer's pad token ID.
 
     Returns:
-        Configured NLLLoss function.
+        torch.nn.NLLLoss: Configured negative log-likelihood loss function.
     """
     return torch.nn.NLLLoss(ignore_index=datasets['train'].tokenizer.pad_token_id, reduction='sum')
 
-def train(model, data_loader, optimizer, loss_fn, device):
-    """Conducts a training epoch over the provided data loader.
+def train_epoch(model, dataloader, loss_fn, optimizer, epoch, args, writer):
+    """
+    Train the model for one epoch.
 
     Args:
-        model: The SentenceVAE model to train.
-        data_loader: DataLoader for the training data.
-        optimizer: Optimizer for the training.
-        loss_fn: Loss function for the training.
-        device: Device to run the training on (e.g., 'cuda' or 'cpu').
-
-    Returns:
-        Tuple containing average loss, average NLL loss, and average KL loss for the epoch.
+        model (SentenceVAE): The model to train.
+        dataloader (DataLoader): DataLoader for the training data.
+        loss_fn (torch.nn.Module): Loss function.
+        optimizer (torch.optim.Optimizer): Optimizer.
+        epoch (int): Current epoch number.
+        args (Namespace): Arguments containing configuration for training.
+        writer (SummaryWriter): TensorBoard writer for logging metrics.
     """
     model.train()
-    total_loss, total_nll_loss, total_kl_loss = 0, 0, 0
-    for batch in tqdm(data_loader, desc="Training"):
+    total_steps = len(dataloader.dataset) * epoch
+    progress_bar = tqdm(enumerate(dataloader), total=len(dataloader), desc=f"Epoch {epoch} train")
+
+    for batch_idx, batch in progress_bar:
         input_ids, attention_mask, targets = batch['input_ids'], batch['attention_mask'], batch['target_ids']
-        input_ids, attention_mask, targets = input_ids.to(device), attention_mask.to(device), targets.to(device)
+        input_ids, attention_mask, targets = input_ids.to(args.device), attention_mask.to(args.device), targets.to(args.device)
+
+        logits, mu, log_sigma_squared, z = model(input_ids, attention_mask)
+        log_probs = torch.log_softmax(logits, dim=-1).transpose(1, 2)
+        nll_loss = loss_fn(log_probs, targets)
+
+        current_step = total_steps + batch_idx
+
+        kl_weight = kl_anneal_function(args.anneal_function, current_step, args.k, args.annealing_till)
+        kl_loss = -0.5 * torch.sum(1 + log_sigma_squared - mu.pow(2) - log_sigma_squared.exp()) / input_ids.size(0)
+        weighted_kl_loss = kl_weight * kl_loss
+
+        loss = nll_loss + weighted_kl_loss
 
         optimizer.zero_grad()
-        outputs, mu, log_sigma_squared = model(input_ids, attention_mask)
-        log_probs = torch.log_softmax(outputs, dim=-1).transpose(1, 2)
-        nll_loss = loss_fn(log_probs, targets)
-        kl_loss = -0.5 * torch.sum(1 + log_sigma_squared - mu.pow(2) - log_sigma_squared.exp()) / input_ids.size(0)
-        loss = nll_loss + kl_loss
-
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
-        total_loss += loss.item()
-        total_nll_loss += nll_loss.item()
-        total_kl_loss += kl_loss.item()
+        writer.add_scalar("train/KL Divergence", kl_loss.item(), current_step)
+        writer.add_scalar("train/Negative Log-Likelihood", nll_loss.item(), current_step)
+        writer.add_scalar("train/ELBO", -loss.item(), current_step)
 
-    num_batches = len(data_loader)
-    return (total_loss / num_batches, total_nll_loss / num_batches, total_kl_loss / num_batches)
+        progress_bar.set_postfix({'nll_loss': nll_loss.item(), 'kl_loss': kl_loss.item(), 'total_loss': loss.item()})
 
-def validate(model, data_loader, loss_fn, device):
-    """Validates the model on the provided data loader.
+def train_model(args):
+    """
+    Main function to train the model.
 
     Args:
-        model: The SentenceVAE model to validate.
-        data_loader: DataLoader for the validation data.
-        loss_fn: Loss function for the validation.
-        device: Device to run the validation on (e.g., 'cuda' or 'cpu').
-
-    Returns:
-        Tuple containing average loss, average NLL loss, and average KL loss for the validation.
+        args (Namespace): Arguments containing configuration for training.
     """
-    model.eval()
-    total_loss, total_nll_loss, total_kl_loss = 0, 0, 0
-    with torch.no_grad():
-        for batch in tqdm(data_loader, desc="Validating"):
-            input_ids, attention_mask, targets = batch['input_ids'], batch['attention_mask'], batch['target_ids']
-            input_ids, attention_mask, targets = input_ids.to(device), attention_mask.to(device), targets.to(device)
+    writer = SummaryWriter()
 
-            outputs, mu, log_sigma_squared = model(input_ids, attention_mask)
-            log_probs = torch.log_softmax(outputs, dim=-1).transpose(1, 2)
-            nll_loss = loss_fn(log_probs, targets)
-            kl_loss = -0.5 * torch.sum(1 + log_sigma_squared - mu.pow(2) - log_sigma_squared.exp()) / input_ids.size(0)
-            loss = nll_loss + kl_loss
+    datasets, dataloaders = prepare_datasets_and_loaders(args)
+    model = initialize_model(args, datasets)
+    model.to(args.device)
+    optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
+    loss_fn = configure_loss_function(datasets)
 
-            total_loss += loss.item()
-            total_nll_loss += nll_loss.item()
-            total_kl_loss += kl_loss.item()
+    for epoch in range(args.epochs):
+        train_epoch(model, dataloaders['train'], loss_fn, optimizer, epoch, args, writer)
 
-    num_batches = len(data_loader)
-    return (total_loss / num_batches, total_nll_loss / num_batches, total_kl_loss / num_batches)
+    save_model_and_config(args, model, datetime.now().strftime('%Y-%m-%d_%H-%M-%S'))
+
+    writer.close()
+    print("Training completed and model saved. All data logged to TensorBoard.")

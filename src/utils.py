@@ -1,71 +1,84 @@
-import os
-import matplotlib.pyplot as plt
 import torch
+import os
+import json
+import numpy as np
+from model import SentenceVAE
 
-def plot_metrics(data, labels, title, ylabel, filename, directory='plots'):
+def kl_anneal_function(anneal_function, step, k, annealing_till):
     """
-    Plots training and validation metrics.
+    Computes the annealing factor for the KL divergence.
 
     Args:
-        data (List[List[float]]): A list of lists containing metric data for each plot.
-        labels (List[str]): Labels for each plot line.
-        title (str): The title of the plot.
-        ylabel (str): The label for the y-axis.
-        filename (str): The filename to save the plot as.
-        directory (str): The directory to save the plot in.
-    """
-    # Ensure the directory exists
-    if not os.path.exists(directory):
-        os.makedirs(directory)
-    
-    # Plotting
-    plt.figure(figsize=(10, 5))
-    for metric, label in zip(data, labels):
-        plt.plot(metric, label=label)
-    plt.title(title)
-    plt.xlabel('Epochs')
-    plt.ylabel(ylabel)
-    plt.legend()
-    plt.grid(True)
-    plt.savefig(os.path.join(directory, filename))
-    plt.close()
-
-def save_model(model, path, filename):
-    """
-    Saves the model's state dictionary to a file.
-
-    Args:
-        model (torch.nn.Module): The model to save.
-        path (str): The directory to save the model in.
-        filename (str): The filename to use for saving the model.
-    """
-    if not os.path.exists(path):
-        os.makedirs(path)
-    torch.save(model.state_dict(), os.path.join(path, filename))
-    print(f"Model saved to {os.path.join(path, filename)}")
-
-def load_model(model, path):
-    """
-    Loads a model's state dictionary from a file.
-
-    Args:
-        model (torch.nn.Module): The model to load state into.
-        path (str): The path to the model file to load.
-    """
-    model.load_state_dict(torch.load(path))
-    model.eval()
-    print(f"Model loaded from {path}")
-    return model
-
-def create_summary_writer(logdir):
-    """
-    Creates a TensorBoard SummaryWriter.
-
-    Args:
-        logdir (str): The directory to store TensorBoard logs.
+        anneal_function (str): The type of annealing function to use ('logistic' or 'linear').
+        step (int): The current training step.
+        k (float): The annealing rate.
+        annealing_till (int): The step until which to anneal.
 
     Returns:
-        SummaryWriter: A TensorBoard SummaryWriter object.
+        float: The annealing factor.
     """
-    from torch.utils.tensorboard import SummaryWriter
-    return SummaryWriter(logdir)
+    if anneal_function == 'logistic':
+        return float(1 / (1 + np.exp(-k * (step - annealing_till))))
+    elif anneal_function == 'linear':
+        return min(1, step / annealing_till)
+
+def save_model_and_config(args, model, timestamp):
+    """
+    Saves the trained model and its configuration.
+
+    Args:
+        args (Namespace): Arguments containing configuration for saving the model.
+        model (SentenceVAE): The trained model.
+        timestamp (str): Timestamp to append to the model file names.
+    """
+    model_path = os.path.join(args.save_model_path, f"model_final_{timestamp}.pt")
+    config_path = os.path.join(args.save_model_path, f"model_final_{timestamp}_config.json")
+    
+    # Save model state_dict
+    torch.save(model.state_dict(), model_path)
+    print(f"Model state dict saved to {model_path}")
+
+    # Save model config
+    model_config = {
+        "latent_dim": model.latent_dim,
+        "hidden_size": model.hidden_size,
+        "vocab_size": model.vocab_size,
+        "special_tokens": model.special_tokens,
+        "max_seq_length": model.max_seq_length,
+        "word_dropout_rate": model.word_dropout_rate,
+        "gru_layers": model.gru_layers,
+    }
+    
+    with open(config_path, 'w') as f:
+        json.dump(model_config, f)
+    print(f"Model config saved to {config_path}")
+
+def load_model(config_path, model_path, device):
+    """
+    Loads a trained SentenceVAE model from a configuration file and checkpoint.
+
+    Args:
+        config_path (str): Path to the model configuration file.
+        model_path (str): Path to the model checkpoint.
+        device (torch.device): Device to load the model onto.
+
+    Returns:
+        SentenceVAE: Loaded model.
+    """
+    with open(config_path, 'r') as f:
+        model_config = json.load(f)
+    
+    model = SentenceVAE(
+        latent_dim=model_config['latent_dim'],
+        hidden_size=model_config['hidden_size'],
+        vocab_size=model_config['vocab_size'],
+        special_tokens=model_config['special_tokens'],
+        max_seq_length=model_config['max_seq_length'],
+        word_dropout_rate=model_config['word_dropout_rate'],
+        gru_layers=model_config['gru_layers']
+    )
+    
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.to(device)
+    model.eval()
+    return model

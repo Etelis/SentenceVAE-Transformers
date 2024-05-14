@@ -1,26 +1,19 @@
-import os
 from torch.utils.data import Dataset
-from transformers import BertTokenizer
+from transformers import BartTokenizer
+import os
 
-class PTBDataset(Dataset):
+class PTB(Dataset):
     """
-    Penn Treebank Dataset for training Sentence Variational Autoencoder models.
-    This dataset loads the Penn Treebank (PTB) data files, preprocesses text lines
-    using a BERT tokenizer, and creates the necessary inputs for the SentenceVAE model.
+    Penn Treebank (PTB) Dataset for Language Modeling using BART Tokenizer.
+
+    Args:
+        data_dir (str): Directory containing the PTB dataset files.
+        split (str): Data split to load ('train', 'valid', or 'test').
+        max_sequence_length (int, optional): Maximum length of sequences for input to the model. Defaults to 128.
     """
     def __init__(self, data_dir, split, max_sequence_length=128):
-        """
-        Initializes the PTBDataset.
-
-        Args:
-            data_dir (str): Directory where the data files are located.
-            split (str): Type of dataset split ('train', 'valid', or 'test').
-            max_sequence_length (int): Maximum length of tokenized sequences.
-        """
-        self.tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
-        self.sos_token_id = self.tokenizer.convert_tokens_to_ids('[unused0]')
-        self.eos_token_id = self.tokenizer.convert_tokens_to_ids('[unused1]')
-        self.pad_token_id = self.tokenizer.pad_token_id
+        super().__init__()
+        self.tokenizer = BartTokenizer.from_pretrained('facebook/bart-base')
         self.data_dir = data_dir
         self.split = split
         self.max_sequence_length = max_sequence_length
@@ -28,18 +21,19 @@ class PTBDataset(Dataset):
 
     def _load_data(self):
         """
-        Loads and preprocesses the data from files.
+        Loads and tokenizes the PTB data from the specified split.
 
         Returns:
-            List[Dict]: List of dictionaries containing the input_ids, attention_mask, and target_ids.
+            list of dict: A list of dictionaries containing tokenized input_ids, attention_mask, and target_ids.
         """
         file_path = os.path.join(self.data_dir, f'ptb.{self.split}.txt')
         data = []
+        
         with open(file_path, 'r', encoding='utf-8') as file:
             for line in file:
-                modified_line = '[unused0] ' + line.strip() + ' [unused1]'
+                line = line.strip()
                 tokens = self.tokenizer.encode_plus(
-                    modified_line,
+                    line,
                     add_special_tokens=True,
                     max_length=self.max_sequence_length,
                     truncation=True,
@@ -47,30 +41,36 @@ class PTBDataset(Dataset):
                     return_attention_mask=True,
                     return_tensors='pt'
                 )
+
+                target_ids = tokens['input_ids'].clone()
+                target_ids[:, :-1] = tokens['input_ids'][:, 1:]
+                target_ids[:, -1] = self.tokenizer.pad_token_id
+
                 data.append({
                     'input_ids': tokens['input_ids'].squeeze(0),
                     'attention_mask': tokens['attention_mask'].squeeze(0),
-                    'target_ids': tokens['input_ids'].squeeze(0)  # Target is same as input for autoencoding tasks
+                    'target_ids': target_ids.squeeze(0),
                 })
+
         return data
 
     def __len__(self):
         """
-        Returns the number of examples in this dataset.
+        Returns the number of samples in the dataset.
 
         Returns:
-            int: Total number of examples.
+            int: Number of samples in the dataset.
         """
         return len(self.data)
 
     def __getitem__(self, idx):
         """
-        Retrieves a single item from the dataset.
+        Retrieves the sample at the specified index.
 
         Args:
-            idx (int): Index of the item to retrieve.
+            idx (int): Index of the sample to retrieve.
 
         Returns:
-            Dict: A dictionary containing the input_ids, attention_mask, and target_ids.
+            dict: A dictionary containing input_ids, attention_mask, and target_ids for the sample.
         """
         return self.data[idx]
